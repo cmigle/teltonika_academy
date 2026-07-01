@@ -1,0 +1,12 @@
+# Object files and libraries
+*.o
+*.so
+*.exe
+
+# Build output
+/01-c-debugging/[0-9][0-9]_*
+!/01-c-debugging/*.c
+/01-c-debugging/copied_file.txt
+/02-address-book/addressbook
+/03-shared-library/src/addressbook
+/04-tuya-iot-daemon/tuya_daemon
