@@ -71,6 +71,8 @@ struct Person* create_address_node(char *address_line)
     char *name = strtok(address_line, DELIMETER);
     char *surname = strtok(NULL, DELIMETER);
     char *email = strtok(NULL, DELIMETER);
+    // there is no delimiter after number - accept "," or a leftover "\n"
+    // so this works whether or not the caller already stripped the newline
     char *number = strtok(NULL, ",\n");
 
     if (name == NULL || surname == NULL || email == NULL || number == NULL) {
