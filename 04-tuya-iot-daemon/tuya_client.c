@@ -2,72 +2,268 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <syslog.h>
+#include <libubus.h>
+#include <libubox/blobmsg.h>
+#include <libubox/blobmsg_json.h>
 
 #include "cJSON.h"
 #include "tuya_cacert.h"
-#include "tuya_log.h"
 #include "tuya_error_code.h"
 #include "system_interface.h"
 #include "mqtt_client_interface.h"
 #include "tuyalink_core.h"
 #include "tuya_client.h"
 
-// FIX: identifier/parameter name must match EXACTLY what was defined in the
-// Tuya IoT Platform's Function Definition for the Action.
-#define ACTION_CODE_SAVE_TEXT "save_text"
-#define ACTION_PARAM_TEXT     "text"
-#define ACTION_LOG_PATH       "/tmp/tuya_action.log"
+#define ACTION_CODE_LIST_ESP_DEVICES "list_esp_devices"
+#define ACTION_CODE_SET_ESP_PIN      "set_esp_pin"
+#define ACTION_CODE_GET_ESP_SENSOR   "get_esp_sensor"
 
 static tuya_mqtt_context_t client_instance;
+static struct ubus_context *ubus_context;
 
-// ----------------- Action handling -----------------
+struct ubus_reply {
+    char *json;
+};
 
-// Parses an ACTION_EXECUTE payload (msg->data_string), pulls out the text
-// parameter, and appends it to /tmp/tuya_action.log.
+static void ubus_reply_cb(struct ubus_request *request, int type,
+                          struct blob_attr *msg)
+{
+    struct ubus_reply *reply = request->priv;
+
+    (void) type;
+    free(reply->json);
+    reply->json = msg == NULL ? strdup("{}") : blobmsg_format_json(msg, true);
+}
+static int call_esp_ubus(const char *method, const char *arguments,
+                         char **reply_json)
+{
+    uint32_t object_id;
+    struct blob_buf request_buffer = { 0 };
+    struct ubus_reply reply = { 0 };
+    int result;
+
+    if (ubus_context == NULL) {
+        syslog(LOG_ERR, "call_esp_ubus: no ubus connection");
+        return -1;
+    }
+
+    result = ubus_lookup_id(ubus_context, "esp", &object_id);
+    if (result != 0) {
+        syslog(LOG_ERR, "call_esp_ubus: ubus_lookup_id(\"esp\") failed: %s",
+               ubus_strerror(result));
+        return result;
+    }
+
+    blob_buf_init(&request_buffer, 0);
+    if (arguments != NULL && arguments[0] != '\0' &&
+        !blobmsg_add_json_from_string(&request_buffer, arguments)) {
+        syslog(LOG_ERR, "call_esp_ubus: invalid argument JSON: %s", arguments);
+        blob_buf_free(&request_buffer);
+        return -1;
+    }
+
+    syslog(LOG_INFO, "call_esp_ubus: invoking esp '%s' args=%s",
+           method, arguments != NULL ? arguments : "{}");
+    result = ubus_invoke(ubus_context, object_id, method,
+                         request_buffer.head, ubus_reply_cb, &reply, 5000);
+    blob_buf_free(&request_buffer);
+    if (result != 0) {
+        syslog(LOG_ERR, "call_esp_ubus: ubus_invoke(esp,%s) failed: %s",
+               method, ubus_strerror(result));
+        free(reply.json);
+        return result;
+    }
+
+    *reply_json = reply.json != NULL ? reply.json : strdup("{}");
+    return *reply_json == NULL ? -1 : 0;
+}
+
+static int action_is_supported(const char *action_code)
+{
+    return action_code != NULL &&
+           (strcmp(action_code, ACTION_CODE_LIST_ESP_DEVICES) == 0 ||
+            strcmp(action_code, ACTION_CODE_SET_ESP_PIN) == 0 ||
+            strcmp(action_code, ACTION_CODE_GET_ESP_SENSOR) == 0);
+}
+
+static int json_string_param(const cJSON *params, const char *name,
+                             const char **value)
+{
+    cJSON *item = cJSON_GetObjectItem(params, name);
+    if (!cJSON_IsString(item) || item->valuestring == NULL)
+        return -1;
+    *value = item->valuestring;
+    return 0;
+}
+
+static int json_pin_param(const cJSON *params, int *pin)
+{
+    cJSON *item = cJSON_GetObjectItem(params, "pin");
+    if (!cJSON_IsNumber(item))
+        return -1;
+    *pin = item->valueint;
+    return 0;
+}
+
+static int handle_action_list_esp_devices(const cJSON *params, cJSON **result)
+{
+    char *reply = NULL;
+
+    (void) params;
+    if (call_esp_ubus("devices", "{}", &reply) != 0)
+        return -1;
+    *result = cJSON_Parse(reply);
+    free(reply);
+    return *result == NULL ? -1 : 0;
+}
+
+static int handle_action_set_esp_pin(const cJSON *params, cJSON **result)
+{
+    const char *port;
+    cJSON *state_item = cJSON_GetObjectItem(params, "state");
+    int pin;
+    char arguments[256];
+    char *reply = NULL;
+    const char *method;
+
+    if (json_string_param(params, "port", &port) != 0 ||
+        json_pin_param(params, &pin) != 0 || !cJSON_IsBool(state_item))
+        return -2;
+
+    method = cJSON_IsTrue(state_item) ? "on" : "off";
+    snprintf(arguments, sizeof(arguments),
+             "{\"port\":\"%s\",\"pin\":%d}", port, pin);
+    if (call_esp_ubus(method, arguments, &reply) != 0)
+        return -1;
+    *result = cJSON_Parse(reply);
+    free(reply);
+    return *result == NULL ? -1 : 0;
+}
+
+static int handle_action_get_esp_sensor(const cJSON *params, cJSON **result)
+{
+    const char *port;
+    const char *model;
+    const char *sensor;
+    int pin;
+    char arguments[384];
+    char *reply = NULL;
+
+    if (json_string_param(params, "port", &port) != 0 ||
+        json_pin_param(params, &pin) != 0 ||
+        json_string_param(params, "model", &model) != 0 ||
+        json_string_param(params, "sensor", &sensor) != 0) {
+        char *dump = cJSON_PrintUnformatted(params);
+        syslog(LOG_ERR, "get_esp_sensor: missing/invalid inputParams "
+               "(need port,pin,model,sensor), got: %s", dump ? dump : "?");
+        free(dump);
+        return -2;
+    }
+
+    snprintf(arguments, sizeof(arguments),
+             "{\"port\":\"%s\",\"pin\":%d,\"model\":\"%s\",\"sensor\":\"%s\"}",
+             port, pin, model, sensor);
+    if (call_esp_ubus("get", arguments, &reply) != 0)
+        return -1;
+    *result = cJSON_Parse(reply);
+    free(reply);
+    return *result == NULL ? -1 : 0;
+}
+
+static int dispatch_action(const char *action_code, const cJSON *input_params,
+                           cJSON **result)
+{
+    if (strcmp(action_code, ACTION_CODE_LIST_ESP_DEVICES) == 0)
+        return handle_action_list_esp_devices(input_params, result);
+    if (strcmp(action_code, ACTION_CODE_SET_ESP_PIN) == 0)
+        return handle_action_set_esp_pin(input_params, result);
+    if (strcmp(action_code, ACTION_CODE_GET_ESP_SENSOR) == 0)
+        return handle_action_get_esp_sensor(input_params, result);
+    return -2;
+}
+
+static int send_action_response(const tuyalink_message_t *request,
+                                int code, const char *error, cJSON *result)
+{
+    cJSON *response = cJSON_CreateObject();
+    char *payload;
+    char topic[TUYA_MQTT_TOPIC_MAXLEN + TUYA_MQTT_DEVICE_ID_MAXLEN + 64];
+    int ret;
+
+    if (response == NULL)
+        return -1;
+    cJSON_AddStringToObject(response, "msgId", request->msgid != NULL ?
+                            request->msgid : "");
+    cJSON_AddNumberToObject(response, "time", (double) time(NULL) * 1000);
+    cJSON_AddNumberToObject(response, "code", code);
+    if (error != NULL)
+        cJSON_AddStringToObject(response, "error", error);
+    if (result != NULL)
+        cJSON_AddItemToObject(response, "data", result);
+
+    payload = cJSON_PrintUnformatted(response);
+    cJSON_Delete(response);
+    if (payload == NULL)
+        return -1;
+
+    snprintf(topic, sizeof(topic), "tylink/%s/thing/action/execute_response",
+             client_instance.config.device_id);
+    ret = mqtt_client_publish(client_instance.mqtt_client, topic,
+                              (const uint8_t *) payload, strlen(payload),
+                              MQTT_QOS_1);
+    free(payload);
+    return ret == MQTT_STATUS_SUCCESS ? 0 : -1;
+}
+
+// Parses an ACTION_EXECUTE payload (msg->data_string) and dispatches it to
+// the matching action handler.
 static void handle_action_execute(const tuyalink_message_t *msg)
 {
     if (msg->data_string == NULL) {
-        TY_LOGW("action execute received with no data");
+        syslog(LOG_WARNING, "action execute received with no data");
+        send_action_response(msg, 1, "Missing action data", NULL);
         return;
     }
 
+    syslog(LOG_INFO, "action execute payload: %s", msg->data_string);
+
     cJSON *root = cJSON_Parse(msg->data_string);
     if (root == NULL) {
-        TY_LOGE("failed to parse action JSON: %s", msg->data_string);
+        syslog(LOG_ERR, "failed to parse action JSON: %s", msg->data_string);
+        send_action_response(msg, 1, "Invalid action JSON", NULL);
         return;
     }
 
     cJSON *action_code = cJSON_GetObjectItem(root, "actionCode");
     cJSON *input_params = cJSON_GetObjectItem(root, "inputParams");
 
-    if (action_code == NULL || input_params == NULL) {
-        TY_LOGE("action JSON missing actionCode/inputParams: %s", msg->data_string);
+    if (!cJSON_IsString(action_code) || input_params == NULL ||
+        !cJSON_IsObject(input_params)) {
+        syslog(LOG_ERR, "action JSON missing actionCode/inputParams: %s", msg->data_string);
+        send_action_response(msg, 1, "Missing actionCode or inputParams", NULL);
         cJSON_Delete(root);
         return;
     }
 
-    if (strcmp(action_code->valuestring, ACTION_CODE_SAVE_TEXT) != 0) {
-        TY_LOGW("unrecognized actionCode: %s", action_code->valuestring);
+    if (!action_is_supported(action_code->valuestring)) {
+        syslog(LOG_WARNING, "unrecognized actionCode: %s", action_code->valuestring);
+        send_action_response(msg, 1, "Unsupported action", NULL);
         cJSON_Delete(root);
         return;
     }
 
-    cJSON *text_param = cJSON_GetObjectItem(input_params, ACTION_PARAM_TEXT);
-    if (text_param == NULL || text_param->valuestring == NULL) {
-        TY_LOGE("action missing input parameter");
-        cJSON_Delete(root);
-        return;
-    }
+    syslog(LOG_INFO, "dispatching actionCode=%s", action_code->valuestring);
 
-    FILE *log_file = fopen(ACTION_LOG_PATH, "a");
-    if (log_file != NULL) {
-        fprintf(log_file, "%s\n", text_param->valuestring);
-        fclose(log_file);
-        TY_LOGI("action saved text: %s", text_param->valuestring);
-    } else {
-        TY_LOGE("failed to open action log file");
-    }
-
+    cJSON *result = NULL;
+    int action_result = dispatch_action(action_code->valuestring, input_params,
+                                        &result);
+    syslog(LOG_INFO, "actionCode=%s dispatch result=%d",
+           action_code->valuestring, action_result);
+    send_action_response(msg, action_result == 0 ? 0 : 1,
+                         action_result == -2 ? "Invalid action parameters" :
+                         action_result == 0 ? NULL : "ESP UBUS request failed",
+                         result);
     cJSON_Delete(root);
 }
 
@@ -75,16 +271,32 @@ static void handle_action_execute(const tuyalink_message_t *msg)
 
 static void on_connected(tuya_mqtt_context_t *context, void *user_data)
 {
-    (void) context;
+    // data model get response can exceed the SDK's fixed RX buffer and force a disconnect
     (void) user_data;
-    TY_LOGI("Tuya MQTT connected");
+    char topic[128];
+
+    // The bundled SDK only subscribes to the auto_subscribe channel and relies
+    // on Tuya's server-side "subscription-free" forwarding for everything else.
+    // If that is not active for this project, downlinks never reach us - so
+    // subscribe to this device's whole topic tree explicitly.
+    snprintf(topic, sizeof(topic), "tylink/%s/#", context->config.device_id);
+    mqtt_client_subscribe(context->mqtt_client, topic, 1);
+    syslog(LOG_INFO, "Tuya MQTT connected; subscribed to %s", topic);
+
+    // Downlink round-trip probe: ask Tuya for the time. The reply arrives on
+    // tylink/<id>/ext/time/response (message type 32). If we never see it,
+    // Tuya is not delivering anything downstream to this device.
+    if (tuyalink_time_get(context, "{}") == OPRT_OK)
+        syslog(LOG_INFO, "sent ext/time/request probe");
+    else
+        syslog(LOG_ERR, "failed to send ext/time/request probe");
 }
 
 static void on_disconnect(tuya_mqtt_context_t *context, void *user_data)
 {
     (void) context;
     (void) user_data;
-    TY_LOGW("Tuya MQTT disconnected");
+    syslog(LOG_WARNING, "Tuya MQTT disconnected");
 }
 
 static void on_messages(tuya_mqtt_context_t *context, void *user_data, const tuyalink_message_t *msg)
@@ -92,7 +304,7 @@ static void on_messages(tuya_mqtt_context_t *context, void *user_data, const tuy
     (void) context;
     (void) user_data;
 
-    TY_LOGI("received message id=%s type=%d code=%d", msg->msgid, msg->type, msg->code);
+    syslog(LOG_INFO, "received message id=%s type=%d code=%d", msg->msgid, msg->type, msg->code);
 
     switch (msg->type) {
         case THING_TYPE_ACTION_EXECUTE:
@@ -101,6 +313,11 @@ static void on_messages(tuya_mqtt_context_t *context, void *user_data, const tuy
         default:
             break;
     }
+}
+
+static int mqtt_context_is_initialized(void)
+{
+    return client_instance.mqtt_client != NULL;
 }
 
 // ----------------- public API -----------------
@@ -117,106 +334,50 @@ int tuya_client_start(const char *product_id, const char *device_id, const char 
         .device_id = device_id,
         .device_secret = device_secret,
         .keepalive = 100,
-        .timeout_ms = 2000,
+        .timeout_ms = 10000,
         .on_connected = on_connected,
         .on_disconnect = on_disconnect,
         .on_messages = on_messages
     });
 
     if (ret != OPRT_OK) {
-        TY_LOGE("tuya_mqtt_init failed, code=%d", ret);
+        syslog(LOG_ERR, "tuya_mqtt_init failed, code=%d", ret);
+        return -1;
+    }
+
+    ubus_context = ubus_connect(NULL);
+    if (ubus_context == NULL) {
+        syslog(LOG_ERR, "failed to connect to ubus");
+        tuya_mqtt_deinit(&client_instance);
+        client_instance.mqtt_client = NULL;
         return -1;
     }
 
     ret = tuya_mqtt_connect(&client_instance);
     if (ret != OPRT_OK) {
-        TY_LOGE("tuya_mqtt_connect failed, code=%d", ret);
+        syslog(LOG_ERR, "tuya_mqtt_connect failed, code=%d", ret);
         return -1;
     }
 
     return 0;
 }
 
+int tuya_client_stop(void)
+{
+    if (ubus_context != NULL) {
+        ubus_free(ubus_context);
+        ubus_context = NULL;
+    }
+    if (!mqtt_context_is_initialized())
+        return 0;
+
+    (void) tuya_mqtt_disconnect(&client_instance);
+    (void) tuya_mqtt_deinit(&client_instance);
+    client_instance.mqtt_client = NULL;
+    return 0;
+}
+
 void tuya_client_loop(void)
 {
     tuya_mqtt_loop(&client_instance);
-}
-
-int tuya_client_report_system_info(const struct system_info *info)
-{
-    cJSON *root = cJSON_CreateObject();
-    long long now_ms = (long long) time(NULL) * 1000;
-
-    cJSON *total_ram = cJSON_CreateObject();
-    cJSON_AddNumberToObject(total_ram, "value", (double) (info->total_ram_bytes / 1024));
-    cJSON_AddNumberToObject(total_ram, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "total_ram", total_ram);
-
-    cJSON *free_ram = cJSON_CreateObject();
-    cJSON_AddNumberToObject(free_ram, "value", (double) (info->free_ram_bytes / 1024));
-    cJSON_AddNumberToObject(free_ram, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "free_ram", free_ram);
-
-    cJSON *uptime = cJSON_CreateObject();
-    cJSON_AddNumberToObject(uptime, "value", (double) info->uptime_seconds);
-    cJSON_AddNumberToObject(uptime, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "uptime", uptime);
-
-    cJSON *cpu_usage = cJSON_CreateObject();
-    cJSON_AddNumberToObject(cpu_usage, "value", info->cpu_usage_percent);
-    cJSON_AddNumberToObject(cpu_usage, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "cpu_usage", cpu_usage);
-
-    cJSON *names = cJSON_CreateArray();
-    cJSON *ips = cJSON_CreateArray();
-    cJSON *netmasks = cJSON_CreateArray();
-    cJSON *tx_bytes = cJSON_CreateArray();
-    cJSON *rx_bytes = cJSON_CreateArray();
-
-    for (int i = 0; i < info->interface_count; i++) {
-        const struct iface_info *iface = &info->interfaces[i];
-        cJSON_AddItemToArray(names, cJSON_CreateString(iface->name));
-        cJSON_AddItemToArray(ips, cJSON_CreateString(iface->ip));
-        cJSON_AddItemToArray(netmasks, cJSON_CreateString(iface->netmask));
-        cJSON_AddItemToArray(tx_bytes, cJSON_CreateNumber((double) iface->tx_bytes));
-        cJSON_AddItemToArray(rx_bytes, cJSON_CreateNumber((double) iface->rx_bytes));
-    }
-
-    cJSON *if_names = cJSON_CreateObject();
-    cJSON_AddItemToObject(if_names, "value", names);
-    cJSON_AddNumberToObject(if_names, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "if_names", if_names);
-
-    cJSON *if_ips = cJSON_CreateObject();
-    cJSON_AddItemToObject(if_ips, "value", ips);
-    cJSON_AddNumberToObject(if_ips, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "if_ips", if_ips);
-
-    cJSON *if_netmasks = cJSON_CreateObject();
-    cJSON_AddItemToObject(if_netmasks, "value", netmasks);
-    cJSON_AddNumberToObject(if_netmasks, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "if_netmasks", if_netmasks);
-
-    cJSON *if_tx = cJSON_CreateObject();
-    cJSON_AddItemToObject(if_tx, "value", tx_bytes);
-    cJSON_AddNumberToObject(if_tx, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "if_tx_bytes", if_tx);
-
-    cJSON *if_rx = cJSON_CreateObject();
-    cJSON_AddItemToObject(if_rx, "value", rx_bytes);
-    cJSON_AddNumberToObject(if_rx, "time", (double) now_ms);
-    cJSON_AddItemToObject(root, "if_rx_bytes", if_rx);
-
-    char *json_string = cJSON_PrintUnformatted(root);
-    int ret = -1;
-    if (json_string != NULL) {
-        ret = tuyalink_thing_property_report(&client_instance, NULL, json_string);
-        if (ret != OPRT_OK) {
-            TY_LOGE("tuyalink_thing_property_report failed, code=%d", ret);
-        }
-        free(json_string);
-    }
-
-    cJSON_Delete(root);
-    return ret;
 }

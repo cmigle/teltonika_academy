@@ -1,7 +1,7 @@
 #ifndef SYSINFO_H
 #define SYSINFO_H
 
-#include <netinet/in.h>  // for INET_ADDRSTRLEN
+#include <netinet/in.h>
 
 #define MAX_INTERFACES 16
 
@@ -22,10 +22,7 @@ struct system_info {
     int interface_count;
 };
 
-// Fills `out` with a fresh snapshot of RAM, uptime, network interfaces
-// (excluding loopback), and CPU usage (measured over a 1-second window,
-// so this function blocks for about 1 second). Returns 0 on success,
-// -1 on failure.
+// RAM, uptime, network interfaces, and CPU usage assigned here
 int collect_system_info(struct system_info *out);
 
 #endif

@@ -1,18 +1,37 @@
 #include <stdio.h>
 #include <unistd.h>
-#include <time.h>
+#include <signal.h>
+#include <string.h>
 #include <syslog.h>
 #include "args.h"
 #include "daemonize.h"
-#include "sysinfo.h"
 #include "tuya_client.h"
 
-#define REPORT_INTERVAL_SECONDS 30
 #define LOOP_SLEEP_USECONDS 200000  // 200ms - how often tuya_client_loop() is polled
+
+static volatile sig_atomic_t g_should_exit = 0;
+
+static void handle_shutdown_signal(int signum)
+{
+    (void) signum;
+    g_should_exit = 1;
+}
 
 int main(int argc, char **argv)
 {
+    struct sigaction action;
     struct arguments args;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handle_shutdown_signal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+
+    if (sigaction(SIGINT, &action, NULL) != 0 || sigaction(SIGTERM, &action, NULL) != 0) {
+        syslog(LOG_ERR, "failed to install signal handlers");
+        return 1;
+    }
+
     parse_arguments(argc, argv, &args);
 
     if (args.daemon_mode) {
@@ -30,42 +49,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // FIX: track real elapsed wall-clock time with time(), not a loop-iteration
-    // counter - each loop iteration only sleeps 200ms, so counting iterations
-    // and comparing against a value in SECONDS was a unit mismatch.
-    time_t last_report_time = 0; // 0 forces an immediate report on first iteration
-
-    while (1) {
-        // tuya_mqtt_loop() must be called frequently and must never be
-        // blocked by our own sleep()s, or keepalive/incoming Action messages
-        // would be delayed or missed entirely.
+    while (!g_should_exit) {
+        // tuya_mqtt_loop() must be called frequently and must never be blocked
         tuya_client_loop();
-
-        time_t now = time(NULL);
-        if (now - last_report_time >= REPORT_INTERVAL_SECONDS) {
-            struct system_info info;
-
-            if (collect_system_info(&info) == 0) {
-                // collect_system_info() blocks ~1s internally (CPU measurement)
-                syslog(LOG_INFO, "RAM total=%llu MB free=%llu MB, uptime=%ld s, CPU=%.2f%%",
-                       info.total_ram_bytes / 1024 / 1024,
-                       info.free_ram_bytes / 1024 / 1024,
-                       info.uptime_seconds,
-                       info.cpu_usage_percent);
-
-                if (tuya_client_report_system_info(&info) != 0) {
-                    syslog(LOG_ERR, "failed to report system info to Tuya cloud");
-                }
-            } else {
-                syslog(LOG_ERR, "failed to collect system info");
-            }
-
-            last_report_time = time(NULL);
-        }
 
         usleep(LOOP_SLEEP_USECONDS);
     }
 
+    tuya_client_stop();
     closelog();
     return 0;
 }
