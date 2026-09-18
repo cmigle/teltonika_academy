@@ -1,0 +1,16 @@
+#ifndef ARGS_H
+#define ARGS_H
+
+// Where parsed command-line values end up.
+struct arguments {
+    char *device_id;
+    char *device_secret;
+    char *product_id;
+    int daemon_mode;
+};
+
+// Parses argv using argp. Exits the program via argp's own error handling
+// if a required argument is missing.
+void parse_arguments(int argc, char **argv, struct arguments *args);
+
+#endif
