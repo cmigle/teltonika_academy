@@ -1,0 +1,280 @@
+#!/usr/bin/lua
+
+-- openvpn-monitor
+-- Registers an ubus object openvpn.<server_name> for every enabled
+-- OpenVPN server with the methods:
+--   get_clients - returns the connected clients
+--   disconnect  - disconnects a client by common name (management "kill")
+
+local ubus = require "ubus"
+local uci = require "uci"
+local nixio = require "nixio"
+local uloop = require "uloop"
+
+-- uloop must be initialised before connecting to ubus and adding objects
+uloop.init()
+
+local conn = ubus.connect()
+assert(conn, "cannot connect to ubus")
+local cursor = uci.cursor()
+
+
+-- UCI helper function
+local function option(section, name, default)
+    local value = cursor:get("openvpn", section, name)
+    return value or default
+end
+
+
+-- Parses CLIENT_LIST lines (status-version 2 format) from any line iterator
+-- Returns the clients table
+local function parse_status_lines(iter)
+    local users = {}
+
+    for line in iter do
+        if line:match("^CLIENT_LIST,") then
+            -- parse CSV line into field array
+            local fields = {}
+            for value in (line .. ","):gmatch("(.-),") do
+                fields[#fields + 1] = value
+            end
+
+            -- Status-version 2 field order:
+            -- [1]=CLIENT_LIST
+            -- [2]=Common Name
+            -- [3]=Real Address
+            -- [4]=Virtual Addr
+            -- [5]=Virtual IPv6
+            -- [6]=Bytes Received
+            -- [7]=Bytes Sent
+            -- [8]=Connected Since
+            -- [9]=Connected Since (t)
+            -- [10]=Username
+            -- [11]=Client ID
+            -- [12]=Peer ID
+            -- [13]=Data Channel Cipher
+
+            if fields[2] then
+                users[#users + 1] = {
+                    common_name       = fields[2],
+                    real_address      = fields[3],
+                    virtual_address   = fields[4],
+                    virtual_ipv6      = fields[5],
+                    bytes_received    = tonumber(fields[6]) or 0,
+                    bytes_sent        = tonumber(fields[7]) or 0,
+                    connected_since   = fields[8],
+                    connected_since_t = tonumber(fields[9]) or 0,
+                    username          = fields[10] ~= "" and fields[10] or nil,
+                    client_id         = tonumber(fields[11]),
+                    peer_id           = tonumber(fields[12]),
+                    cipher            = fields[13]
+                }
+            end
+        end
+    end
+
+    return users
+end
+
+
+-- Reads clients from the OpenVPN status file
+-- Returns the clients table or nil + error message
+local function read_status(path)
+    local file = io.open(path, "r")
+    if not file then return nil, "cannot open status file: " .. path end
+
+    local users = parse_status_lines(file:lines())
+    file:close()
+    return users
+end
+
+
+-- Sends a command via the management TCP socket
+-- mgmt_conf format: "127.0.0.1 7505"
+-- Returns the response or nil + error message
+local function management_command(mgmt_conf, command)
+    -- Parse the management configuration
+    local host, port = mgmt_conf:match("^(%S+)%s+(%d+)")
+    if not host or not port then
+        return nil, "invalid management config: " .. tostring(mgmt_conf)
+    end
+
+    -- Create the TCP socket
+    local socket, err = nixio.socket("inet", "stream")
+    if not socket then return nil, "socket error: " .. tostring(err) end
+
+    -- Connect to the management interface
+    local ok, connect_err = socket:connect(host, tonumber(port))
+    if not ok then
+        socket:close()
+        return nil, "connect error: " .. tostring(connect_err)
+    end
+
+    -- Read the greeting line (">INFO:OpenVPN Management Interface...")
+    socket:recv(4096)
+
+    -- Send the command
+    socket:send(command .. "\n")
+
+    -- Read the response
+    local result = {}
+    while true do
+        local data = socket:recv(4096)
+        if not data or data == "" then break end
+        result[#result + 1] = data
+        -- Check if we received the full response
+        if data:find("SUCCESS:", 1, true) or
+           data:find("ERROR:", 1, true) or
+           data:find("END", 1, true) then
+            break
+        end
+    end
+
+    socket:close()
+    return table.concat(result)
+end
+
+
+-- Reads clients via the management interface.
+-- "status 2" always returns the status-version 2 format,
+-- independent of the status-version set in the server configuration.
+local function read_status_mgmt(mgmt_conf)
+    local reply, err = management_command(mgmt_conf, "status 2")
+    if not reply then return nil, err end
+    return parse_status_lines(reply:gmatch("[^\r\n]+"))
+end
+
+
+-- Finds the management address of a server:
+-- first the "management" option, then the "extra" option
+-- (RutOS stores custom directives there, e.g. "management 127.0.0.1 7505")
+local function get_management(section)
+    local management = option(section, "management")
+    if not management then
+        local extra = option(section, "extra", "")
+        management = extra:match("management%s+(%S+%s+%d+)")
+    end
+    return management
+end
+
+
+-- Creates a separate ubus object for each OpenVPN server
+-- with get_clients and disconnect methods
+local function add_server(name, section)
+    -- Status file path from UCI or the default RutOS path.
+    -- The status option may also be written as "path interval",
+    -- so only the first word (the path) is kept.
+    local status = option(section, "status",
+        "/var/run/openvpn." .. section .. ".status")
+    status = status:match("^(%S+)")
+
+    -- Management configuration (e.g.: "127.0.0.1 7505")
+    local management = get_management(section)
+
+    -- Reads clients via management if available, otherwise from the status file
+    local function get_users()
+        if management then
+            return read_status_mgmt(management)
+        end
+        return read_status(status)
+    end
+
+    local methods = {
+        -- Method: get_clients
+        -- Returns all connected clients
+        get_clients = {
+            function(req, msg)
+                local users, err = get_users()
+                if not users then
+                    conn:reply(req, { error = err, users = {} })
+                    return
+                end
+                conn:reply(req, {
+                    server = name,
+                    client_count = #users,
+                    users = users
+                })
+            end,
+            {}  -- parametrų schema: jokių parametrų
+        },
+
+        -- Method: disconnect
+        -- Disconnects a client via the management interface "kill" command
+        -- Parameter: name = client's common_name
+        disconnect = {
+            function(req, msg)
+                local target = msg and msg.name
+                if not target then
+                    conn:reply(req, {
+                        success = false,
+                        error = "missing 'name' parameter"
+                    })
+                    return
+                end
+
+                -- Check if the management interface is configured
+                if not management then
+                    conn:reply(req, {
+                        success = false,
+                        error = "management interface not configured for this server"
+                    })
+                    return
+                end
+
+                -- Check if the client exists
+                local users = get_users()
+                if users then
+                    local found = false
+                    for _, u in ipairs(users) do
+                        if u.common_name == target then
+                            found = true
+                            break
+                        end
+                    end
+                    if not found then
+                        conn:reply(req, {
+                            success = false,
+                            error = "client '" .. target .. "' not found"
+                        })
+                        return
+                    end
+                end
+
+                -- Send the "kill" command via the management interface
+                local reply, err = management_command(management, "kill " .. target)
+
+                local success = reply ~= nil and not reply:find("ERROR:", 1, true)
+                conn:reply(req, {
+                    success = success,
+                    message = success and "client disconnected" or (err or reply),
+                    client = target
+                })
+            end,
+            { name = ubus.STRING }  -- accepts the "name" parameter (string)
+        }
+    }
+
+    -- conn:add takes one table: { ["object.name"] = methods }
+    conn:add({ ["openvpn." .. name] = methods })
+end
+
+
+-- Iterate over all OpenVPN instances in the UCI configuration
+cursor:foreach("openvpn", "openvpn", function(section)
+    local inst_name = section[".name"]       -- UCI instancijos pavadinimas (pvz.: inst2)
+    local stype = section.type or ""         -- "server" arba "client"
+    -- Teltonika uses "enable", standard OpenWrt uses "enabled"
+    local enabled = section.enable or section.enabled or "0"
+
+    -- Register only enabled servers (not clients)
+    if inst_name and stype == "server" and enabled ~= "0" then
+        -- Use the display name if available, otherwise use the instance name
+        local display_name = section.name or inst_name
+        add_server(display_name, inst_name)
+    end
+end)
+
+
+-- Launch the event loop - the program runs as a daemon
+uloop.run()
+conn:close()
