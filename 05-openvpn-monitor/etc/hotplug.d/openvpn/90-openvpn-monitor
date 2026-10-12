@@ -1,0 +1,14 @@
+#!/bin/sh
+# Called by hotplug-call when an OpenVPN tunnel goes up or down
+# (/usr/libexec/openvpn-hotplug -> hotplug-call openvpn).
+# The init script itself decides whether the monitor should run.
+#
+# A short delay lets the openvpn process finish starting or exiting
+# before the init script checks for it; running it in the background
+# keeps openvpn from waiting on this script.
+
+case "$ACTION" in
+	up|down|"")
+		( sleep 2; /etc/init.d/openvpn-monitor restart ) >/dev/null 2>&1 &
+		;;
+esac
