@@ -1,0 +1,133 @@
+From 0ef3912a0863a28c6ac5cefca934975a7450e2df Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Migl=C4=97=20Cirtautait=C4=97?=
+ <migle.cirtautaite@gmail.com>
+Date: Tue, 20 Oct 2026 16:26:23 +0300
+Subject: [PATCH] interface-ip: use interface gateway for static routes without
+ one
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A route without a "gateway" option is documented to use the gateway of
+its interface, but netifd installs it as a link-scope route, so the
+target is unreachable on DHCP/NCM/QMI uplinks.
+
+When such a route is installed, copy the nexthop of the best matching
+protocol route of the same interface into the route sent to the kernel.
+The configured route keeps an empty nexthop, so it is recognised again
+and re-installed whenever the protocol routes change. Targets inside the
+interface's own subnet, onlink routes and typed routes are not changed.
+
+Fixes: https://github.com/openwrt/openwrt/issues/10791
+
+Signed-off-by: Miglė Cirtautaitė <migle.cirtautaite@gmail.com>
+---
+ interface-ip.c | 66 +++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/interface-ip.c b/interface-ip.c
+index b367410..b18bee3 100644
+--- a/interface-ip.c
++++ b/interface-ip.c
+@@ -360,6 +360,47 @@ interface_set_route_info(struct interface *iface, struct device_route *route)
+ 	}
+ }
+ 
++static int
++interface_add_config_route(struct interface *iface, struct device *dev,
++			   struct device_route *route)
++{
++	bool v6 = (route->flags & DEVADDR_FAMILY) == DEVADDR_INET6;
++	struct device_route r = *route, *r_next = NULL;
++	union if_addr zero = {};
++
++	if (!memcmp(&route->nexthop, &zero, sizeof(zero)) &&
++	    !(route->flags & (DEVROUTE_ONLINK | DEVROUTE_TYPE | DEVROUTE_NODEV)) &&
++	    !interface_ip_find_addr_target(iface, &route->addr, v6)) {
++		__find_ip_route_target(&iface->proto_ip, &route->addr, v6, &r_next);
++		if (r_next && r_next->mask <= route->mask)
++			r.nexthop = r_next->nexthop;
++	}
++
++	return system_add_route(dev, &r);
++}
++
++/* protocol routes changed: re-install static routes without a gateway */
++static void
++interface_refresh_config_routes(struct interface *iface)
++{
++	struct device_route *route;
++	union if_addr zero = {};
++
++	vlist_for_each_element(&iface->config_ip.route, route, node) {
++		if (!route->enabled || (route->flags & DEVADDR_EXTERNAL) ||
++		    memcmp(&route->nexthop, &zero, sizeof(zero)))
++			continue;
++
++		route->failed = !!interface_add_config_route(iface, iface->l3_dev.dev, route);
++	}
++}
++
+ void
+ interface_ip_add_neighbor(struct interface *iface, struct blob_attr *attr, bool v6)
+ {
+@@ -942,9 +983,14 @@ __interface_update_route(struct interface_ip_settings *ip,
+ 	if (node_new) {
+ 		bool _enabled = enable_route(ip, route_new);
+ 
+-		if (!(route_new->flags & DEVADDR_EXTERNAL) && !keep && _enabled)
+-			if (system_add_route(dev, route_new))
++		if (!(route_new->flags & DEVADDR_EXTERNAL) && !keep && _enabled) {
++			int ret = (ip == &iface->config_ip) ?
++				interface_add_config_route(iface, dev, route_new) :
++				system_add_route(dev, route_new);
++
++			if (ret)
+ 				route_new->failed = true;
++		}
+ 
+ 		route_new->iface = iface;
+ 		route_new->enabled = _enabled;
+@@ -1748,9 +1794,16 @@ interface_ip_set_route_enabled(struct interface_ip_settings *ip,
+ 		return;
+ 
+ 	if (enabled) {
++		int ret;
++
+ 		interface_set_route_info(ip->iface, route);
+ 
+-		if (system_add_route(dev, route))
++		if (ip == &ip->iface->config_ip)
++			ret = interface_add_config_route(ip->iface, dev, route);
++		else
++			ret = system_add_route(dev, route);
++
++		if (ret)
+ 			route->failed = true;
+ 	} else
+ 		system_del_route(dev, route);
+@@ -1870,6 +1923,9 @@ void interface_ip_set_enabled(struct interface_ip_settings *ip, bool enabled)
+ 
+ 		ip->iface->policy_rules_set = enabled;
+ 	}
++
++	if (enabled && ip == &iface->proto_ip)
++		interface_refresh_config_routes(iface);
+ }
+ 
+ void
+@@ -1940,8 +1996,10 @@ interface_ip_update_complete(struct interface_ip_settings *ip)
+ 	vlist_flush(&ip->prefix);
+ 	vlist_flush(&ip->neighbor);
+ 
+-	if (ip == &ip->iface->proto_ip)
++	if (ip == &ip->iface->proto_ip) {
+ 		interface_host_routes_refresh(ip->iface);
++		interface_refresh_config_routes(ip->iface);
++	}
+ 
+ 	interface_write_resolv_conf(ip->iface->jail);
+ }
+-- 
+2.55.0
+
