@@ -152,6 +152,10 @@ local function get_management(section)
     local management = option(section, "management")
     if not management then
         local extra = option(section, "extra", "")
+        -- multi-line "Extra options" are stored by UCI as a list
+        if type(extra) == "table" then
+            extra = table.concat(extra, "\n")
+        end
         management = extra:match("management%s+(%S+%s+%d+)")
     end
     return management
@@ -195,7 +199,7 @@ local function add_server(name, section)
                     users = users
                 })
             end,
-            {}  -- parametrų schema: jokių parametrų
+            {}  -- parameter schema: no parameters
         },
 
         -- Method: disconnect
@@ -261,8 +265,8 @@ end
 
 -- Iterate over all OpenVPN instances in the UCI configuration
 cursor:foreach("openvpn", "openvpn", function(section)
-    local inst_name = section[".name"]       -- UCI instancijos pavadinimas (pvz.: inst2)
-    local stype = section.type or ""         -- "server" arba "client"
+    local inst_name = section[".name"]       -- UCI instance name (e.g. inst2)
+    local stype = section.type or ""         -- "server" or "client"
     -- Teltonika uses "enable", standard OpenWrt uses "enabled"
     local enabled = section.enable or section.enabled or "0"
 
@@ -270,7 +274,11 @@ cursor:foreach("openvpn", "openvpn", function(section)
     if inst_name and stype == "server" and enabled ~= "0" then
         -- Use the display name if available, otherwise use the instance name
         local display_name = section.name or inst_name
-        add_server(display_name, inst_name)
+        -- one misconfigured server must not stop the others from registering
+        local ok, err = pcall(add_server, display_name, inst_name)
+        if not ok then
+            io.stderr:write("openvpn-monitor: " .. inst_name .. ": " .. tostring(err) .. "\n")
+        end
     end
 end)
 
