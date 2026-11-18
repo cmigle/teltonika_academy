@@ -195,7 +195,7 @@ local function add_server(name, section)
                     users = users
                 })
             end,
-            {}  -- parametrų schema: jokių parametrų
+            {}  -- parameter schema: no parameters
         },
 
         -- Method: disconnect
@@ -261,8 +261,8 @@ end
 
 -- Iterate over all OpenVPN instances in the UCI configuration
 cursor:foreach("openvpn", "openvpn", function(section)
-    local inst_name = section[".name"]       -- UCI instancijos pavadinimas (pvz.: inst2)
-    local stype = section.type or ""         -- "server" arba "client"
+    local inst_name = section[".name"]       -- UCI instance name (e.g. inst2)
+    local stype = section.type or ""         -- "server" or "client"
     -- Teltonika uses "enable", standard OpenWrt uses "enabled"
     local enabled = section.enable or section.enabled or "0"
 
