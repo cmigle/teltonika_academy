@@ -10,7 +10,7 @@ void number_changer(int *var)
 
 int main(void)
 {
-    int *var = 766;
+    int var = 766;
     printf("Before change - %d\n", var);
     number_changer(&var);
     printf("After change - %d\n", var);

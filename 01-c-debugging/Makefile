@@ -1,3 +1,5 @@
+CFLAGS ?= -Wall -Wextra
+
 SRC := $(wildcard *.c)
 BINS := $(SRC:.c=)
 
@@ -6,7 +8,7 @@ BINS := $(SRC:.c=)
 all: $(BINS)
 
 %: %.c
-	$(CC) -w -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^
 
 clean:
-	$(RM) $(BINS)
+	$(RM) $(BINS) copied_file.txt
