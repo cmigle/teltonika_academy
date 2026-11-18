@@ -1,4 +1,4 @@
-From 0ef3912a0863a28c6ac5cefca934975a7450e2df Mon Sep 17 00:00:00 2001
+From 9283fa4d06b523e3c94550d042c5b17f135bd5b0 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?Migl=C4=97=20Cirtautait=C4=97?=
  <migle.cirtautaite@gmail.com>
 Date: Tue, 20 Oct 2026 16:26:23 +0300
@@ -22,14 +22,14 @@ Fixes: https://github.com/openwrt/openwrt/issues/10791
 
 Signed-off-by: Miglė Cirtautaitė <migle.cirtautaite@gmail.com>
 ---
- interface-ip.c | 66 +++++++++++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 62 insertions(+), 4 deletions(-)
+ interface-ip.c | 60 ++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 56 insertions(+), 4 deletions(-)
 
 diff --git a/interface-ip.c b/interface-ip.c
-index b367410..b18bee3 100644
+index b367410..c214f2e 100644
 --- a/interface-ip.c
 +++ b/interface-ip.c
-@@ -360,6 +360,47 @@ interface_set_route_info(struct interface *iface, struct device_route *route)
+@@ -360,6 +360,41 @@ interface_set_route_info(struct interface *iface, struct device_route *route)
  	}
  }
  
@@ -71,7 +71,7 @@ index b367410..b18bee3 100644
  void
  interface_ip_add_neighbor(struct interface *iface, struct blob_attr *attr, bool v6)
  {
-@@ -942,9 +983,14 @@ __interface_update_route(struct interface_ip_settings *ip,
+@@ -942,9 +977,14 @@ __interface_update_route(struct interface_ip_settings *ip,
  	if (node_new) {
  		bool _enabled = enable_route(ip, route_new);
  
@@ -88,7 +88,7 @@ index b367410..b18bee3 100644
  
  		route_new->iface = iface;
  		route_new->enabled = _enabled;
-@@ -1748,9 +1794,16 @@ interface_ip_set_route_enabled(struct interface_ip_settings *ip,
+@@ -1748,9 +1788,16 @@ interface_ip_set_route_enabled(struct interface_ip_settings *ip,
  		return;
  
  	if (enabled) {
@@ -106,7 +106,7 @@ index b367410..b18bee3 100644
  			route->failed = true;
  	} else
  		system_del_route(dev, route);
-@@ -1870,6 +1923,9 @@ void interface_ip_set_enabled(struct interface_ip_settings *ip, bool enabled)
+@@ -1870,6 +1917,9 @@ void interface_ip_set_enabled(struct interface_ip_settings *ip, bool enabled)
  
  		ip->iface->policy_rules_set = enabled;
  	}
@@ -116,7 +116,7 @@ index b367410..b18bee3 100644
  }
  
  void
-@@ -1940,8 +1996,10 @@ interface_ip_update_complete(struct interface_ip_settings *ip)
+@@ -1940,8 +1990,10 @@ interface_ip_update_complete(struct interface_ip_settings *ip)
  	vlist_flush(&ip->prefix);
  	vlist_flush(&ip->neighbor);
  
