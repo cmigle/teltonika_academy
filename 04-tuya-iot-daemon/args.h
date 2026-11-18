@@ -9,8 +9,8 @@ struct arguments {
     int daemon_mode;
 };
 
-// Parses argv using argp. Exits the program via argp's own error handling
-// if a required argument is missing.
+// Parses argv by hand (musl libc on OpenWrt has no argp). Prints usage and
+// exits if a required argument is missing.
 void parse_arguments(int argc, char **argv, struct arguments *args);
 
 #endif
